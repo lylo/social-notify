@@ -36,11 +36,11 @@ Email sent.
 
 The script writes `.last_checked.yml` to track what it has already seen. Running it again immediately will report "No new notifications" unless new activity has arrived.
 
-## Running from cron
+## Running on a schedule
 
-The script is designed to be run unattended on a schedule. Here's how to set it up on a server.
+The script is designed to be run unattended. Here's how to set it up on a server.
 
-### 1. Deploy the files
+### Deploy and test
 
 Copy the project to your server:
 
@@ -48,41 +48,76 @@ Copy the project to your server:
 scp -r social-notify/ yourserver:~/social-notify/
 ```
 
-On the server, make sure Ruby is installed (`ruby --version`) and create your `config.yml`.
-
-### 2. Test it manually first
+On the server, make sure Ruby is installed (`ruby --version`) and create your `config.yml`. Then test manually:
 
 ```sh
 cd ~/social-notify
 ruby social-notify.rb
 ```
 
-Confirm it prints status lines and sends an email (or reports no notifications). Fix any credential issues before adding to cron.
+Confirm it prints status lines and sends an email (or reports no notifications). Fix any credential issues before scheduling.
 
-### 3. Add a cron job
+### Option A: `/etc/cron.d/` (simplest)
 
-Open your crontab:
+If your user crontab is managed by another tool (e.g. the `whenever` gem), use a system cron file instead — these are independent of user crontabs.
 
 ```sh
-crontab -e
+sudo tee /etc/cron.d/social-notify << 'EOF'
+*/15 * * * * deploy cd /home/deploy/social-notify && /usr/bin/ruby social-notify.rb >> /home/deploy/social-notify/cron.log 2>&1
+EOF
 ```
 
-Add a line to run every 15 minutes (adjust to taste):
+Note the extra field after the schedule — that's the username to run as. Adjust `deploy` and paths to match your setup. Find your Ruby path with `which ruby`.
+
+### Option B: systemd timer
+
+If you'd prefer proper logging via `journalctl` and no log file to manage:
+
+```ini
+# /etc/systemd/system/social-notify.service
+[Unit]
+Description=Check social notifications
+
+[Service]
+Type=oneshot
+User=deploy
+WorkingDirectory=/home/deploy/social-notify
+ExecStart=/usr/bin/ruby social-notify.rb
+```
+
+```ini
+# /etc/systemd/system/social-notify.timer
+[Unit]
+Description=Run social-notify every 15 minutes
+
+[Timer]
+OnCalendar=*:0/15
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+```
+
+Then:
+
+```sh
+sudo systemctl daemon-reload
+sudo systemctl enable --now social-notify.timer
+```
+
+Check logs with `journalctl -u social-notify`. Check timer status with `systemctl list-timers social-notify*`.
+
+### Option C: user crontab
+
+If nothing else manages your crontab, `crontab -e` and add:
 
 ```cron
 */15 * * * * cd /home/you/social-notify && /usr/bin/ruby social-notify.rb >> /home/you/social-notify/cron.log 2>&1
 ```
 
-A few things to note:
+### Version manager wrapper
 
-- **Use absolute paths.** Cron runs with a minimal environment — don't rely on `~` or `$HOME` in the command itself.
-- **Find your Ruby path** with `which ruby`. If you use a version manager (rbenv, asdf, mise), use the full shim path or source the version manager in a wrapper script (see below).
-- **Redirect output** to a log file so you can debug failures. The `2>&1` captures both stdout and stderr.
-- **`cd` into the project directory** because the script resolves `config.yml` and `.last_checked.yml` relative to its own location via `__dir__`.
-
-### 4. Version manager wrapper (if needed)
-
-If your Ruby is managed by rbenv, asdf, or mise, cron won't load your shell profile. Create a small wrapper:
+If your Ruby is managed by rbenv, asdf, or mise, cron and systemd won't load your shell profile. Create a wrapper:
 
 ```sh
 #!/bin/sh
@@ -96,24 +131,14 @@ ruby social-notify.rb
 chmod +x ~/social-notify/run.sh
 ```
 
-Then point cron at the wrapper:
+Then point your cron or systemd `ExecStart` at `/home/deploy/social-notify/run.sh` instead.
 
-```cron
-*/15 * * * * /home/you/social-notify/run.sh >> /home/you/social-notify/cron.log 2>&1
-```
+### Log rotation (cron only)
 
-### 5. Log rotation
-
-The log file will grow over time. A simple approach — add a daily cron job to truncate it:
+If using cron with a log file, add a daily truncation:
 
 ```cron
 0 0 * * * truncate -s 0 /home/you/social-notify/cron.log
-```
-
-Or keep the last 1000 lines:
-
-```cron
-0 0 * * * tail -n 1000 /home/you/social-notify/cron.log > /home/you/social-notify/cron.log.tmp && mv /home/you/social-notify/cron.log.tmp /home/you/social-notify/cron.log
 ```
 
 ### Frequency recommendations
@@ -123,7 +148,7 @@ Or keep the last 1000 lines:
 | Every 5 min | `*/5 * * * *` | Near-realtime awareness |
 | Every 15 min | `*/15 * * * *` | Good default |
 | Every hour | `0 * * * *` | Low-traffic accounts |
-| Twice daily | `0 9,18 * * *` | Morning/evening digest |
+| Twice daily | `0 9,16 * * *` | Morning/afternoon digest |
 
 ## How it works
 
@@ -131,7 +156,7 @@ Or keep the last 1000 lines:
 2. Fetches mentions and replies from `app.bsky.notification.listNotifications`
 3. Fetches unread DM conversations from `chat.bsky.convo.listConvos`
 4. Fetches Mastodon mention notifications, separating DMs (visibility `direct`) from public mentions
-5. If anything new is found, composes a plain-text email and sends it via SMTP
+5. If anything new is found, composes an HTML email and sends it via SMTP
 6. Saves timestamps to `.last_checked.yml` so the next run only reports new activity
 
 Each account is checked independently — if one fails (bad credentials, API down), the others still run.
